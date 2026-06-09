@@ -1,11 +1,11 @@
 import os
+import asyncio
+import math
+from datetime import datetime, timedelta
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import requests
-from cachetools import cached, TTLCache
-from datetime import datetime, timedelta
-import math
+import httpx
 
 load_dotenv()
 
@@ -15,18 +15,28 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173"],  # добавьте свой домен при необходимости
     allow_credentials=True,
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-cache = TTLCache(maxsize=128, ttl=5)
+# Глобальный кэш для метрик
+metrics_cache = {
+    "system": {},
+    "minecraft": {},
+    "last_update": None
+}
 
-def run_query(query: str):
-    """Запрос PromQL возвращает число."""
+# ---------------- Асинхронный запрос к Prometheus ----------------
+async def run_query(query: str, client: httpx.AsyncClient) -> float | None:
+    """Асинхронный запрос PromQL возвращает число."""
     try:
-        resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=5)
+        resp = await client.get(
+            f"{PROMETHEUS_URL}/api/v1/query",
+            params={"query": query},
+            timeout=5.0
+        )
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -37,19 +47,18 @@ def run_query(query: str):
     except Exception:
         return None
 
-# --- СИСТЕМНЫЕ МЕТРИКИ
-@cached(cache)
-def get_all_metrics():
-    cpu = run_query('100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)')
-    ram = run_query('100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))')
-    disk = run_query('100 - ((node_filesystem_avail_bytes{mountpoint="/", fstype!="rootfs"} * 100) / node_filesystem_size_bytes{mountpoint="/", fstype!="rootfs"})')
-    uptime_seconds = run_query('time() - node_boot_time_seconds')
+# ---------------- Обновление системных метрик ----------------
+async def update_system_metrics(client: httpx.AsyncClient):
+    cpu = await run_query('100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)', client)
+    ram = await run_query('100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))', client)
+    disk = await run_query('100 - ((node_filesystem_avail_bytes{mountpoint="/", fstype!="rootfs"} * 100) / node_filesystem_size_bytes{mountpoint="/", fstype!="rootfs"})', client)
+    uptime_seconds = await run_query('time() - node_boot_time_seconds', client)
     uptime_days = round(uptime_seconds / 86400, 1) if uptime_seconds is not None else None
-    load1 = run_query('node_load1')
-    ctx_switches = run_query('rate(node_context_switches_total[5m])')
-    tcp_connections = run_query('node_netstat_Tcp_CurrEstab')
-    fd_open = run_query('node_filefd_allocated')
-    swap = run_query('(1 - (node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes)) * 100')
+    load1 = await run_query('node_load1', client)
+    ctx_switches = await run_query('rate(node_context_switches_total[5m])', client)
+    tcp_connections = await run_query('node_netstat_Tcp_CurrEstab', client)
+    fd_open = await run_query('node_filefd_allocated', client)
+    swap = await run_query('(1 - (node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes)) * 100', client)
 
     return {
         "cpu_usage": cpu,
@@ -63,17 +72,15 @@ def get_all_metrics():
         "swap_usage": swap
     }
 
-# --- МЕТРИКИ MINECRAFT
-@cached(cache)
-def get_minecraft_metrics():
-    players = run_query('sum(mc_players_online_total)')
-    chunks = run_query('sum(mc_loaded_chunks_total)')
-    entities = run_query('sum(mc_entities_total)')
-    world_bytes = run_query('sum(mc_world_size)')
-    tps = run_query('mc_tps')
+# ---------------- Обновление метрик Minecraft ----------------
+async def update_minecraft_metrics(client: httpx.AsyncClient):
+    players = await run_query('sum(mc_players_online_total)', client)
+    chunks = await run_query('sum(mc_loaded_chunks_total)', client)
+    entities = await run_query('sum(mc_entities_total)', client)
+    world_bytes = await run_query('sum(mc_world_size)', client)
+    tps = await run_query('mc_tps', client)
 
     world_gb = round(world_bytes / (1024**3), 2) if world_bytes is not None else None
-
     return {
         "players_online": int(players) if players is not None else 0,
         "loaded_chunks": int(chunks) if chunks is not None else 0,
@@ -82,44 +89,57 @@ def get_minecraft_metrics():
         "tps": round(tps, 1) if tps is not None else 0
     }
 
-# --- ЭНДПОИНТЫ 
+# ---------------- Фоновая задача обновления кэша ----------------
+async def background_updater():
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                system = await update_system_metrics(client)
+                minecraft = await update_minecraft_metrics(client)
+                metrics_cache["system"] = system
+                metrics_cache["minecraft"] = minecraft
+                metrics_cache["last_update"] = datetime.now()
+            except Exception as e:
+                print(f"Ошибка обновления метрик: {e}")
+            await asyncio.sleep(5)  # обновление каждые 5 секунд
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_updater())
+
+# ---------------- Эндпоинты (мгновенный ответ из кэша) ----------------
 @app.get("/api/metrics")
-def get_metrics():
-    """cистемные метрики (CPU, RAM, диск и пр.)"""
-    return get_all_metrics()
+async def get_metrics():
+    return metrics_cache["system"]
 
 @app.get("/api/minecraft/metrics")
-def get_minecraft():
-    """игровые метрики (онлайн, чанки, энтити, размер мира, TPS)"""
-    return get_minecraft_metrics()
+async def get_minecraft():
+    return metrics_cache["minecraft"]
 
+# ---------------- Range-запросы (оставляем синхронными, но можно переписать) ----------------
 @app.get("/api/metrics/range")
 def get_metrics_range(metric: str = "cpu", hours: float = 1.0, step: int = 15):
-    """
-    системные метрики за интервал.
-    metric: cpu, ram, disk, net_in, net_out, load1
-    """
     end = datetime.now()
     start = end - timedelta(hours=hours)
     start_ts = int(start.timestamp())
     end_ts = int(end.timestamp())
 
     queries = {
-    "cpu": '100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
-    "ram": '100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))',
-    "disk": '100 - ((node_filesystem_avail_bytes{mountpoint="/", fstype!="rootfs"} * 100) / node_filesystem_size_bytes{mountpoint="/", fstype!="rootfs"})',
-    "swap": '(1 - (node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes)) * 100',
-    "net_in": 'rate(node_network_receive_bytes_total{device="eth0"}[5m]) / 1024 / 1024',
-    "net_out": 'rate(node_network_transmit_bytes_total{device="eth0"}[5m]) / 1024 / 1024',
-    "load1": 'node_load1',
+        "cpu": '100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
+        "ram": '100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))',
+        "disk": '100 - ((node_filesystem_avail_bytes{mountpoint="/", fstype!="rootfs"} * 100) / node_filesystem_size_bytes{mountpoint="/", fstype!="rootfs"})',
+        "swap": '(1 - (node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes)) * 100',
+        "net_in": 'rate(node_network_receive_bytes_total{device="eth0"}[5m]) / 1024 / 1024',
+        "net_out": 'rate(node_network_transmit_bytes_total{device="eth0"}[5m]) / 1024 / 1024',
+        "load1": 'node_load1',
     }
-    
     if metric not in queries:
         return {"error": f"Unknown metric: {metric}"}
     query = queries[metric]
 
     params = {"query": query, "start": start_ts, "end": end_ts, "step": f"{step}s"}
     try:
+        import requests
         resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query_range", params=params, timeout=10)
         if resp.status_code != 200:
             return {"error": "Prometheus range query failed"}
@@ -133,11 +153,7 @@ def get_metrics_range(metric: str = "cpu", hours: float = 1.0, step: int = 15):
         return {"error": str(e)}
 
 @app.get("/api/minecraft/range")
-
 def get_minecraft_range(metric: str = "tps", hours: int = 1, step: int = 15):
-    """
-    игровые метрики за интервал: tps, players, chunks, entities
-    """
     end = datetime.now()
     start = end - timedelta(hours=hours)
     start_ts = int(start.timestamp())
@@ -155,6 +171,7 @@ def get_minecraft_range(metric: str = "tps", hours: int = 1, step: int = 15):
 
     params = {"query": query, "start": start_ts, "end": end_ts, "step": f"{step}s"}
     try:
+        import requests
         resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query_range", params=params, timeout=10)
         if resp.status_code != 200:
             return {"error": "Prometheus range query failed"}
